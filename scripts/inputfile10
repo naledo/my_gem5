@@ -1,0 +1,11 @@
+cd /home/gem5/parsec-benchmark
+source env.sh
+m5 dumpstats
+echo "Parsec Begin!"
+m5 resetstats
+parsecmgmt -a run -p streamcluster -c gcc-hooks -i simsmall -n 16
+m5 dumpstats
+echo "Parsec Done!"
+
+sleep 5
+m5 exit

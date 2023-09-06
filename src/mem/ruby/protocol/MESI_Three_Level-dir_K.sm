@@ -1,0 +1,1101 @@
+/*
+* Copyright (c) 1999-2013 Mark D. Hill and David A. Wood
+* All rights reserved.
+*
+* Redistribution and use in source and binary forms, with or without
+* modification, are permitted provided that the following conditions are
+* met: redistributions of source code must retain the above copyright
+* notice, this list of conditions and the following disclaimer;
+* redistributions in binary form must reproduce the above copyright
+* notice, this list of conditions and the following disclaimer in the
+* documentation and/or other materials provided with the distribution;
+* neither the name of the copyright holders nor the names of its
+* contributors may be used to endorse or promote products derived from
+* this software without specific prior written permission.
+*
+* THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+* "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+* LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+* A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+* OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+* SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+* LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+* DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+* THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+* (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+* OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+*/
+
+machine(MachineType:Directory, "MESI Two Level directory protocol") : 
+
+DirectoryMemory * directory;
+CacheMemory * snooptable;
+
+Cycles to_mem_latency := 6;
+Cycles to_l2_latency := 4;
+
+MessageBuffer * requestToDir, network="From", virtual_network="0",
+        vnet_type="request";
+MessageBuffer * responseToDir, network="From", virtual_network="1",
+        vnet_type="response";
+MessageBuffer * responseFromDir, network="To", virtual_network="1",
+        vnet_type="response";
+
+MessageBuffer * requestToMemory;
+MessageBuffer * responseFromMemory;
+{
+    // STATES
+    state_declaration(State, desc="Directory states", default="Directory_State_I") {
+        // Base states
+        I, AccessPermission:Read_Write, desc="dir is the owner and memory is up-to-date, all other copies are Invalid";
+        V, AccessPermission:Maybe_Stale, desc="memory copy may be stale, i.e. other modified copies may exist";
+
+        I_V, AccessPermission:Busy, desc="Intermediate State I>V";
+        V_I, AccessPermission:Busy, desc="Intermediate State V>I";
+
+        ID, AccessPermission:Busy, desc="Intermediate state for DMA_READ when in I";
+        ID_W, AccessPermission:Busy, desc="Intermediate state for DMA_WRITE when in I";
+
+        V_FX_V, AccessPermission:Busy, desc="Blocked for GETX from V";
+        V_FS_V, AccessPermission:Busy, desc="Blocked for GETS from V";
+        V_UD_V, AccessPermission:Busy, desc="Blocked for UPGRADE from V";
+
+        V_DRD, AccessPermission:Busy, desc="Intermediate State when there is a dma read";
+        V_DRDI, AccessPermission:Busy, desc="Intermediate State when there is a dma read";
+        V_DWR, AccessPermission:Busy, desc="Intermediate State when there is a dma write";
+        V_DWRI, AccessPermission:Busy, desc="Intermediate State when there is a dma write";
+        
+        V_RI, AccessPermission:Busy, desc="Intermediate State when there is a snooptable replacement";
+    }
+
+    // Events
+    enumeration(Event, desc="Directory events") {
+        FetchS, desc="A memory GETS/GET_INSTR arrives";
+        FetchX, desc="A memory GETX arrives";
+        WB_Data, desc="writeback data from LLC arrives";
+        WB_Data_Final, desc="final writeback data from LLC arrives";
+        WB_Data_Clean, desc="final writeback with clean data";
+        RD_Data, desc="read data from LLC arrives";
+
+        UPGRADE_I, desc="LLC request to upgrade need to invalidate other LLC";
+        UPGRADE_NI, desc="LLC request to upgrade, no need to invalidate";
+
+        Memory_Data, desc="Fetched data from memory arrives";
+        Memory_Ack, desc="Writeback Ack from memory arrives";
+        //added by SS for dma
+        DMA_READ, desc="A DMA Read memory request";
+        DMA_WRITE, desc="A DMA Write memory request";
+        //{FetchS, FetchX, WB_Data, WB_Data_Final, WB_Data_Clean, RD_Data, UPGRADE_I, UPGRADE_NI, Memory_Data, Memory_Ack, DMA_READ, DMA_WRITE}
+
+        //SnoopTable
+        ST_Replacement, desc="snoop table replacement";
+    }
+
+    // TYPES
+
+    // DirectoryEntry
+    structure(Entry, desc="...", interface="AbstractCacheEntry", main="false") {
+        State DirectoryState,           desc="Directory state";
+    }
+
+    // SnoopTableEntry
+    structure(StEntry, desc="...", interface="AbstractCacheEntry") {
+        State StState,                desc="Directory state";
+        NetDest Sharers,                desc="Set of the Cache that in shared state";
+    }
+
+    // TBE entries for DMA requests
+    structure(TBE, desc="TBE entries for outstanding DMA requests") {
+        Addr PhysicalAddress,       desc="physical address";
+        State TBEState,             desc="Transient State";
+        DataBlock DataBlk,          desc="Data to be written (DMA write only)";
+        int Len,                    desc="...";
+        MachineID Requestor,        desc="The DMA engine that sent the request";
+        int pendingAcks,            desc="number of pending acks";
+    }
+
+    structure(TBETable, external="yes") {
+        TBE lookup(Addr);
+        void allocate(Addr);
+        void deallocate(Addr);
+        bool isPresent(Addr);
+    }
+
+
+    // ** OBJECTS **
+    TBETable TBEs, template="<Directory_TBE>", constructor="m_number_of_TBEs";
+
+    Tick clockEdge();
+    Tick cyclesToTicks(Cycles c);
+    void set_cache_entry(AbstractCacheEntry b);
+    void unset_cache_entry();
+    void set_tbe(TBE tbe);
+    void unset_tbe();
+    void wakeUpBuffers(Addr a);
+
+    
+
+    Entry getDirectoryEntry(Addr addr), return_by_pointer="yes" {
+        Entry dir_entry := static_cast(Entry, "pointer", directory[addr]);
+
+        if (is_valid(dir_entry)) {
+            return dir_entry;
+        }
+
+        dir_entry :=  static_cast(Entry, "pointer",
+                                directory.allocate(addr, new Entry));
+        return dir_entry;
+    }
+
+    StEntry getSnoopTableEntry(Addr addr), return_by_pointer="yes" {
+        StEntry st_entry := static_cast(StEntry, "pointer", snooptable.lookup(addr));
+        return st_entry;
+    }
+
+    State getState(TBE tbe, StEntry st_entry, Addr addr) {
+        if (is_valid(tbe)) {
+            return tbe.TBEState;
+        } 
+        else {
+            if (is_valid(st_entry)) {
+                assert(st_entry.StState == getDirectoryEntry(addr).DirectoryState);
+            }
+            return getDirectoryEntry(addr).DirectoryState;
+        }
+    }
+
+    void setState(TBE tbe, StEntry st_entry, Addr addr, State state) {
+        if (is_valid(tbe)) {
+            tbe.TBEState := state;
+        }
+        if (is_valid(st_entry)){
+            st_entry.StState := state;
+        }
+        if (state == State:I || state == State:V) {
+            assert(is_valid(tbe) == false);
+        }
+        if (state == State:I) {
+            assert(is_valid(st_entry) == false);
+        }
+        getDirectoryEntry(addr).DirectoryState := state;
+    }
+
+    AccessPermission getAccessPermission(Addr addr) {
+        TBE tbe := TBEs[addr];
+        if(is_valid(tbe)) {
+            DPRINTF(RubySlicc, "%s\n", Directory_State_to_permission(tbe.TBEState));
+            return Directory_State_to_permission(tbe.TBEState);
+        }
+
+        if(directory.isPresent(addr)) {
+            DPRINTF(RubySlicc, "%s\n", Directory_State_to_permission(getDirectoryEntry(addr).DirectoryState));
+            return Directory_State_to_permission(getDirectoryEntry(addr).DirectoryState);
+        }
+
+        DPRINTF(RubySlicc, "%s\n", AccessPermission:NotPresent);
+        return AccessPermission:NotPresent;
+    }
+
+    void setAccessPermission(StEntry st_entry, Addr addr, State state) {
+        getDirectoryEntry(addr).changePermission(Directory_State_to_permission(state));
+    }
+
+    void functionalRead(Addr addr, Packet *pkt) {
+        TBE tbe := TBEs[addr];
+        if(is_valid(tbe)) {
+            testAndRead(addr, tbe.DataBlk, pkt);
+        } else {
+            functionalMemoryRead(pkt);
+        }
+    }
+
+    int functionalWrite(Addr addr, Packet *pkt) {
+        int num_functional_writes := 0;
+
+        TBE tbe := TBEs[addr];
+        if(is_valid(tbe)) {
+            num_functional_writes := num_functional_writes + testAndWrite(addr, tbe.DataBlk, pkt);
+        }
+
+        num_functional_writes := num_functional_writes + functionalMemoryWrite(pkt);
+        return num_functional_writes;
+    }
+
+    int isGETRequest(CoherenceRequestType type) {
+        if (type == CoherenceRequestType:GETS || type == CoherenceRequestType:GET_INSTR){
+            return 1;
+        }
+        else if (type == CoherenceRequestType:GETX){
+            return 2;
+        }
+        return 0;
+    }
+
+    int getPendingAcks(TBE tbe){
+        return tbe.pendingAcks;
+    }
+    
+    Event LLC_request_type_to_event(CoherenceRequestType type,
+            Addr addr, MachineID requestor, StEntry st_entry){
+        if (isGETRequest(type) == 1){
+            return Event:FetchS;
+        }
+        else if (isGETRequest(type) == 2){
+            return Event:FetchX;
+        }
+        else if (type == CoherenceRequestType:UPGRADE) {
+            if(st_entry.Sharers.isElement(requestor)) {
+                if(st_entry.Sharers.count(MachineType:L2Cache) > 1) {
+                    return Event:UPGRADE_I;
+                }
+                else {
+                    return Event:UPGRADE_NI;
+                }
+            }
+            else {
+                return Event:FetchX;
+            }
+        }
+        else {
+            DPRINTF(ProtocolTrace, "Addr: %#x   Type: %s\n",addr, type);
+            DPRINTF(RubySlicc, "Addr: %#x   Type: %s\n",addr, type);
+            error("Invalid message");
+        }
+    }
+
+    // ** OUT_PORTS **
+    out_port(responseNetwork_out, ResponseMsg, responseFromDir);
+    out_port(memQueue_out, MemoryMsg, requestToMemory);
+
+    // ** IN_PORTS **
+
+    in_port(requestNetwork_in, RequestMsg, requestToDir, rank = 0) {
+        if (requestNetwork_in.isReady(clockEdge())) {
+        peek(requestNetwork_in, RequestMsg) {
+
+            DPRINTF(RubySlicc, "This is dir requestNetwork_in dir\n");
+            DPRINTF(RubySlicc, "%s\n", in_msg);
+
+            DPRINTF(ProtocolTrace, "The address1 is %#x\n", in_msg.addr);
+            DPRINTF(ProtocolTrace, "The address2 is %#x\n", makeLineAddress(in_msg.addr));
+
+            assert(in_msg.Destination.isElement(machineID));
+
+            if (in_msg.Type == CoherenceRequestType:DMA_READ) {
+                DPRINTF(ProtocolTrace, "The address3 is %#x\n", in_msg.addr);
+                trigger(Event:DMA_READ, makeLineAddress(in_msg.addr),
+                    getSnoopTableEntry(makeLineAddress(in_msg.addr)), 
+                    TBEs[makeLineAddress(in_msg.addr)]);
+            } 
+            else if (in_msg.Type == CoherenceRequestType:DMA_WRITE) {
+                trigger(Event:DMA_WRITE, makeLineAddress(in_msg.addr),
+                    getSnoopTableEntry(makeLineAddress(in_msg.addr)), 
+                    TBEs[makeLineAddress(in_msg.addr)]);
+            }
+            else {
+                StEntry st_entry := getSnoopTableEntry(in_msg.addr);
+                TBE tbe := TBEs[in_msg.addr];
+                if (is_valid(st_entry)) {
+                    trigger(LLC_request_type_to_event(
+                        in_msg.Type, in_msg.addr,
+                        in_msg.Requestor, st_entry),
+                        in_msg.addr, st_entry, tbe);
+
+                }
+                else if (snooptable.cacheAvail(in_msg.addr)) {
+                    trigger(LLC_request_type_to_event(
+                        in_msg.Type, in_msg.addr,
+                        in_msg.Requestor, st_entry),
+                        in_msg.addr, st_entry, tbe);
+                }
+                else {
+                    Addr victim := snooptable.cacheProbe(in_msg.addr);
+                    DPRINTF(RubySlicc, "address: %#x  victim: %#x\n", in_msg.addr, victim);
+                    trigger(Event:ST_Replacement, victim,
+                        getSnoopTableEntry(victim), TBEs[victim]);
+                }
+            }
+        }
+        }
+    }
+
+    in_port(responseNetwork_in, ResponseMsg, responseToDir, rank = 1) {
+        if (responseNetwork_in.isReady(clockEdge())) {
+        peek(responseNetwork_in, ResponseMsg) {
+
+            DPRINTF(RubySlicc, "This is dir responseNetwork_in dir\n");
+            DPRINTF(RubySlicc, "%s\n", in_msg);
+
+            assert(in_msg.Destination.isElement(machineID));
+            TBE tbe := TBEs[in_msg.addr];
+            StEntry st_entry := getSnoopTableEntry(in_msg.addr);
+
+            assert(is_valid(st_entry));
+
+            DPRINTF(RubySlicc, "Addr: %#x State: %s Sender: %s Type: %s Dest: %s\n",
+                in_msg.addr, getState(TBEs[in_msg.addr], st_entry, in_msg.addr),
+                in_msg.Sender, in_msg.Type, in_msg.Destination);
+
+            // Cache突然踢出数据
+            if (in_msg.Type == CoherenceResponseType:MEMORY_DATA) {
+                if(is_valid(tbe)) {
+                    if ((getPendingAcks(tbe)) == 1){
+                        trigger(Event:WB_Data_Final, in_msg.addr, 
+                            st_entry, tbe);
+                    }
+                    else {
+                        trigger(Event:WB_Data, in_msg.addr, 
+                            st_entry, tbe);
+                    }
+                }
+                else {
+                    if(st_entry.Sharers.count(MachineType:L2Cache) > 1) {
+                        trigger(Event:WB_Data, in_msg.addr, 
+                            st_entry, tbe);
+                    }
+                    else {
+                        if(in_msg.Dirty == true) {
+                            trigger(Event:WB_Data_Final, in_msg.addr, 
+                                st_entry, tbe);
+                        }
+                        else {
+                            trigger(Event:WB_Data_Clean, in_msg.addr, 
+                                st_entry, tbe);
+                        }
+                    }
+                }
+            }
+            else if (in_msg.Type == CoherenceResponseType:RD_DATA) {
+                trigger(Event:RD_Data, in_msg.addr, st_entry, tbe);
+            }
+            else {
+                DPRINTF(ProtocolTrace, "%s\n", in_msg);
+                DPRINTF(RubySlicc, "%s\n", in_msg);
+                error("Invalid message");
+            }
+        }
+        }
+    }
+
+    // off-chip memory request/response is done
+    in_port(memQueue_in, MemoryMsg, responseFromMemory, rank = 2) {
+        if (memQueue_in.isReady(clockEdge())) {
+        peek(memQueue_in, MemoryMsg) {
+
+            DPRINTF(RubySlicc, "This is dir memQueue_in dir\n");
+            DPRINTF(ProtocolTrace, "%s\n", in_msg);    
+
+            TBE tbe := TBEs[in_msg.addr];
+            StEntry st_entry := getSnoopTableEntry(in_msg.addr);
+
+            if (in_msg.Type == MemoryRequestType:MEMORY_READ) {
+                trigger(Event:Memory_Data, in_msg.addr, st_entry, tbe);
+            } else if (in_msg.Type == MemoryRequestType:MEMORY_WB) {
+                trigger(Event:Memory_Ack, in_msg.addr, st_entry, tbe);
+            } else {
+                DPRINTF(ProtocolTrace, "%s\n", in_msg);
+                DPRINTF(RubySlicc, "%s\n", in_msg.Type);
+                error("Invalid message");
+            }
+        }
+        }
+    }
+
+
+    // Actions
+
+    // 分配ST空间是头等事件
+    action(sta_SnoopTableAllocate, "sta", desc="Allocate SnoopTable Entry"){
+        assert(is_invalid(cache_entry));
+        set_cache_entry(snooptable.allocate(address, new StEntry));
+    }
+
+    action(std_SnoopTableDeallocate, "std", desc="Deallocate SnoopTable Entry"){
+        DPRINTF(RubySlicc, "We need to evict this address: %#x\n ", address);
+        assert(is_valid(getSnoopTableEntry(address)));
+        snooptable.deallocate(address);
+        DPRINTF(RubySlicc, "Success victim address: %#x\n ", address);
+        unset_cache_entry();
+    }
+
+    // 为替换算法设置MRU
+    action(rst_setMRU,"rst",desc="manually set the MRU bit for st entry") {
+        assert(is_valid(cache_entry));
+        snooptable.setMRU(address);
+    }
+
+    action(a_sendAck, "a", desc="Send ack to L2") {
+        peek(responseNetwork_in, ResponseMsg) {  //从这里拿消息
+        enqueue(responseNetwork_out, ResponseMsg, to_l2_latency) { //从这里进消息
+            out_msg.addr := address;
+            out_msg.Type := CoherenceResponseType:MEMORY_ACK;
+            out_msg.Sender := machineID;
+            out_msg.Destination.add(in_msg.Sender);
+            out_msg.MessageSize := MessageSizeType:Response_Control;
+        }
+        }
+    }
+
+    action(a_sendUpgradeAck, "aia", desc="Send upgrade ack to L2") {
+        enqueue(responseNetwork_out, ResponseMsg, to_l2_latency){
+            assert(is_valid(tbe));
+            out_msg.addr := address;
+            out_msg.Type := CoherenceResponseType:UPGRADE_ACK;
+            out_msg.Sender := machineID;
+            out_msg.Destination.add(tbe.Requestor);
+            out_msg.MessageSize := MessageSizeType:Response_Control;
+        }
+    }
+
+    action(ani_sendUpgradeAck, "ani", desc="Send upgrade ack to L2, actually no inv") {
+        peek(requestNetwork_in, RequestMsg) {
+        enqueue(responseNetwork_out, ResponseMsg, to_l2_latency){
+            out_msg.addr := address;
+            out_msg.Type := CoherenceResponseType:UPGRADE_ACK;
+            out_msg.Sender := machineID;
+            out_msg.Destination.add(in_msg.Requestor);
+            out_msg.MessageSize := MessageSizeType:Response_Control;
+        }
+        }
+    }
+
+    action(dfc_sendData_from_Cache, "dfc", desc="Send data from other Cache to requestor") {
+        peek(responseNetwork_in, ResponseMsg){
+        enqueue(responseNetwork_out, ResponseMsg, to_l2_latency) {
+            assert(is_valid(tbe));
+            assert(is_valid(cache_entry));
+            out_msg.addr := address;
+            out_msg.Type := CoherenceResponseType:MEMORY_DATA;
+            out_msg.Sender := machineID;
+            out_msg.Destination.add(tbe.Requestor);
+            out_msg.DataBlk := in_msg.DataBlk;
+            out_msg.Dirty := in_msg.Dirty;
+            out_msg.MessageSize := MessageSizeType:Response_Data;
+            cache_entry.Sharers.add(tbe.Requestor);
+        }
+        }
+    }
+    
+    action(dsefc_sendData_Exclusive_from_Cache, "dsefc", desc="Send Exclusive data from other Cache to requestor") {
+        peek(responseNetwork_in, ResponseMsg){
+        enqueue(responseNetwork_out, ResponseMsg, to_l2_latency) {
+            assert(is_valid(tbe));
+            assert(is_valid(cache_entry));
+            out_msg.addr := address;
+            out_msg.Type := CoherenceResponseType:MEMORY_DATA_EXCLUSIVE;
+            out_msg.Sender := machineID;
+            out_msg.Destination.add(tbe.Requestor);
+            out_msg.DataBlk := in_msg.DataBlk;
+            out_msg.Dirty := in_msg.Dirty;
+            out_msg.MessageSize := MessageSizeType:Response_Data;
+            cache_entry.Sharers.add(tbe.Requestor);
+        }
+        }
+    }
+
+    action(dse_sendData_Exclusive, "dse", desc="Send Exclusive Data to requestor") {
+        peek(memQueue_in, MemoryMsg) {
+        enqueue(responseNetwork_out, ResponseMsg, to_l2_latency) {
+            assert(is_valid(cache_entry));
+            out_msg.addr := address;
+            out_msg.Type := CoherenceResponseType:MEMORY_DATA_EXCLUSIVE;
+            out_msg.Sender := machineID;
+            out_msg.Destination.add(in_msg.OriginalRequestorMachId);
+            out_msg.DataBlk := in_msg.DataBlk;
+            out_msg.Dirty := false;
+            out_msg.MessageSize := MessageSizeType:Response_Data;
+            cache_entry.Sharers.add(in_msg.OriginalRequestorMachId);
+        }
+        }
+    }
+
+    // Actions
+    action(aa_sendAck, "aa", desc="Send ack to L2") {
+        peek(memQueue_in, MemoryMsg) {
+        enqueue(responseNetwork_out, ResponseMsg, to_l2_latency) {
+            out_msg.addr := address;
+            out_msg.Type := CoherenceResponseType:MEMORY_ACK;
+            out_msg.Sender := machineID;
+            out_msg.Destination.add(in_msg.OriginalRequestorMachId);
+            out_msg.MessageSize := MessageSizeType:Response_Control;
+        }
+        }
+    }
+
+    action(j_popIncomingRequestQueue, "j", desc="Pop incoming request queue") {
+        requestNetwork_in.dequeue(clockEdge());
+    }
+
+    action(k_popIncomingResponseQueue, "k", desc="Pop incoming request queue") {
+        responseNetwork_in.dequeue(clockEdge());
+    }
+
+    action(l_popMemQueue, "q", desc="Pop off-chip request queue") {
+        memQueue_in.dequeue(clockEdge());
+    }
+
+    action(kd_wakeUpDependents, "kd", desc="wake-up dependents") {
+        wakeUpBuffers(address);
+    }
+
+    action(qf_queueMemoryFetchRequest, "qf", desc="Queue off-chip fetch request") {
+        peek(requestNetwork_in, RequestMsg) {
+        enqueue(memQueue_out, MemoryMsg, to_mem_latency) {
+            out_msg.addr := address;
+            out_msg.Type := MemoryRequestType:MEMORY_READ;
+            out_msg.Sender := in_msg.Requestor;
+            out_msg.MessageSize := MessageSizeType:Request_Control;
+            out_msg.Len := 0;
+            DPRINTF(ProtocolTrace, "%s\n", out_msg); 
+        }
+        }
+    }
+
+    action(qw_queueMemoryWBRequest, "qw", desc="Queue off-chip writeback request") {
+        peek(responseNetwork_in, ResponseMsg) {
+        enqueue(memQueue_out, MemoryMsg, to_mem_latency) {
+            out_msg.addr := address;
+            out_msg.Type := MemoryRequestType:MEMORY_WB;
+            out_msg.Sender := in_msg.Sender;
+            out_msg.MessageSize := MessageSizeType:Writeback_Data;
+            out_msg.DataBlk := in_msg.DataBlk;
+            out_msg.Len := 0;
+        }
+        }
+    }
+
+    //added by SS for dma
+    action(qf_queueMemoryFetchRequestDMA, "qfd", desc="Queue off-chip fetch request") {
+        peek(requestNetwork_in, RequestMsg) {
+        enqueue(memQueue_out, MemoryMsg, to_mem_latency) {
+            out_msg.addr := address;
+            out_msg.Type := MemoryRequestType:MEMORY_READ;
+            out_msg.Sender := in_msg.Requestor;
+            out_msg.MessageSize := MessageSizeType:Request_Control;
+            out_msg.Len := 0;
+        }
+        }
+    }
+
+    action(dr_sendDMAData, "dr", desc="Send Data to DMA controller from directory") {
+        peek(memQueue_in, MemoryMsg) {
+        enqueue(responseNetwork_out, ResponseMsg, to_l2_latency) {
+            assert(is_valid(tbe));
+            out_msg.addr := address;
+            out_msg.Type := CoherenceResponseType:DATA;
+            out_msg.DataBlk := in_msg.DataBlk;   // we send the entire data block and rely on the dma controller to split it up if need be
+            out_msg.Destination.add(tbe.Requestor);
+            out_msg.MessageSize := MessageSizeType:Response_Data;
+        }
+        }
+    }
+
+    action(qw_queueMemoryWBRequest_partial, "qwp", desc="Queue off-chip writeback request") {
+        peek(requestNetwork_in, RequestMsg) {
+        enqueue(memQueue_out, MemoryMsg, to_mem_latency) {
+            out_msg.addr := address;
+            out_msg.Type := MemoryRequestType:MEMORY_WB;
+            out_msg.Sender := machineID;
+            out_msg.MessageSize := MessageSizeType:Writeback_Data;
+            out_msg.DataBlk := in_msg.DataBlk;
+            out_msg.Len := in_msg.Len;
+        }
+        }
+    }
+
+    action(da_sendDMAAck, "da", desc="Send Ack to DMA controller") {
+        enqueue(responseNetwork_out, ResponseMsg, to_l2_latency) {
+            assert(is_valid(tbe));
+            out_msg.addr := address;
+            out_msg.Type := CoherenceResponseType:ACK;
+            out_msg.Destination.add(tbe.Requestor);
+            out_msg.MessageSize := MessageSizeType:Writeback_Control;
+        }
+    }
+
+    action(z_stallAndWaitRequest, "z", desc="recycle request queue") {
+        //停止掉该buffer某一端口的某一地址
+        //将该请求放入m_stall_msg_map中，删除掉requestToDir的队首消息
+        stall_and_wait(requestNetwork_in, address);
+    }
+
+    action(zz_recycleDMAQueue, "zz", desc="recycle DMA queue") {
+        requestNetwork_in.recycle(clockEdge(), cyclesToTicks(recycle_latency));
+    }
+
+
+    action(inv_sendCacheInvalidate, "inv", desc="Invalidate a list of cache blocks") {
+        enqueue(responseNetwork_out, ResponseMsg, to_l2_latency) {
+            assert(is_valid(cache_entry));
+            out_msg.addr := address;
+            out_msg.Type := CoherenceResponseType:INV;
+            out_msg.Sender := machineID;
+            assert(cache_entry.Sharers.count(MachineType:L2Cache)>0);
+            out_msg.Destination := cache_entry.Sharers.getSharers(MachineType:L2Cache);
+            out_msg.MessageSize := MessageSizeType:Response_Control;
+        }
+    }
+
+    action(drp_sendDMAData, "drp", desc="Send Data to DMA controller from incoming PUTX") {
+        peek(responseNetwork_in, ResponseMsg) {
+        enqueue(responseNetwork_out, ResponseMsg, to_l2_latency) {
+            assert(is_valid(tbe));
+            out_msg.addr := address;
+            out_msg.Type := CoherenceResponseType:DATA;
+            out_msg.DataBlk := in_msg.DataBlk;   // we send the entire data block and rely on the dma controller to split it up if need be
+            out_msg.Destination.add(tbe.Requestor);
+            out_msg.MessageSize := MessageSizeType:Response_Data;
+        }
+        }
+    }
+
+    //TODO
+    action(v_allocateTBE, "v", desc="Allocate TBE") {
+        peek(requestNetwork_in, RequestMsg) {
+            TBEs.allocate(address);
+            set_tbe(TBEs[address]);
+            tbe.DataBlk := in_msg.DataBlk;
+            tbe.PhysicalAddress := in_msg.addr;
+            tbe.Len := in_msg.Len;
+            tbe.Requestor := in_msg.Requestor;
+            if (is_valid(cache_entry)) {
+                tbe.pendingAcks := cache_entry.Sharers.count(MachineType:L2Cache);
+            }
+            else {
+                tbe.pendingAcks := 0;
+            }
+            //TODO MachineType
+        }
+    }
+
+    action(qw_queueMemoryWBRequest_partialTBE, "qwt", ddesc="Queue off-chip writeback request") {
+        enqueue(memQueue_out, MemoryMsg, to_mem_latency) {
+            assert(is_valid(tbe));
+            out_msg.addr := tbe.PhysicalAddress;
+            out_msg.Type := MemoryRequestType:MEMORY_WB;
+            out_msg.Sender := tbe.Requestor;
+            out_msg.MessageSize := MessageSizeType:Writeback_Data;
+            out_msg.DataBlk := tbe.DataBlk;
+            out_msg.Len := tbe.Len;
+        }
+    }
+
+    action(w_deallocateTBE, "w", desc="Deallocate TBE") {
+        TBEs.deallocate(address);
+        unset_tbe();
+    }
+
+    action(d_updateAck, "uda", desc="update pending ack count") {
+        peek(responseNetwork_in, ResponseMsg){
+            assert(is_valid(tbe));
+            tbe.pendingAcks := tbe.pendingAcks - 1;
+            APPEND_TRANSITION_COMMENT(in_msg.AckCount);
+            APPEND_TRANSITION_COMMENT(" p: ");
+            APPEND_TRANSITION_COMMENT(tbe.pendingAcks);
+        }
+    }
+
+    action(d_updateSharers, "uds", desc="delete one sharer for clean from LLC") {
+        peek(responseNetwork_in, ResponseMsg){
+            assert(is_valid(cache_entry));
+            assert(cache_entry.Sharers.count(MachineType:L2Cache)>0);
+            cache_entry.Sharers.remove(in_msg.Sender);
+        }
+    }
+
+    action(d_RequestCacheData, "rcd", desc="Request for other LLC request"){
+        enqueue(responseNetwork_out, ResponseMsg, to_l2_latency) {
+            assert(is_valid(cache_entry));
+            out_msg.addr := address;
+            out_msg.Type := CoherenceResponseType:RD_REQ;
+            out_msg.Sender := machineID;
+            out_msg.MessageSize := MessageSizeType:Response_Control;
+            out_msg.Destination.add(cache_entry.Sharers.smallestElement(MachineType:L2Cache));
+        }
+    }
+
+    action(invllc_sendCacheInvalidateMinusRequestor, "invllc", desc="Request to invalidate other LLC") {
+        peek(requestNetwork_in, RequestMsg) {
+        enqueue(responseNetwork_out, ResponseMsg, to_l2_latency) {
+            assert(is_valid(tbe));
+            assert(is_valid(cache_entry));
+            out_msg.addr := address;
+            out_msg.Type := CoherenceResponseType:INV;
+            out_msg.Sender := machineID;
+            out_msg.MessageSize := MessageSizeType:Response_Control;
+            assert(cache_entry.Sharers.count(MachineType:L2Cache)>1);
+            out_msg.Destination := cache_entry.Sharers.getSharers(MachineType:L2Cache);
+            out_msg.Destination.remove(in_msg.Requestor);
+            tbe.pendingAcks := tbe.pendingAcks - 1;
+        }
+        }
+    }
+
+    action(stm_profileMiss,"stm",desc="Profile the demand miss") {
+        snooptable.profileDemandMiss();
+    }
+
+    action(sth_profileHit,"sth",desc="Profile the demand hit") {
+        snooptable.profileDemandHit();
+    }
+
+    action(judge_private_share, "judge", desc="judge V is private or share"){
+        assert(is_valid(cache_entry));
+        if(cache_entry.Sharers.count(MachineType:L2Cache)>1){
+            snooptable.profileShareHit();
+        }
+        else{
+            snooptable.profilePrivateHit();
+        }
+    }
+
+    // TRANSITIONS
+
+    transition(I, {FetchS, FetchX}, I_V) {
+        sta_SnoopTableAllocate;
+        //先分配SnoopTable空间
+        qf_queueMemoryFetchRequest;
+        //1.从requestToDir队列中抓取队首消息进入requestToMemory队列
+        //2.删除requestToDir队首消息
+        stm_profileMiss;
+        j_popIncomingRequestQueue;
+        //删除requestToDir队列的队首元素
+    }
+
+    transition(I_V, Memory_Data, V) {
+        //m_Type = CoherenceResponseType_MEMORY_DATA
+        //m_Destination=in_msg_ptr.m_OriginalRequestorMachId
+        dse_sendData_Exclusive;
+
+        //删除responseFromMemory_ptr的队首元素
+        l_popMemQueue;
+
+        //唤醒因此waiting的requests
+        kd_wakeUpDependents;
+    }
+
+    transition(V, FetchX, V_FX_V) {
+        rst_setMRU;
+        v_allocateTBE;
+        //生成消息INV消息进入responseFromDir队列
+        //out_msg=ResponseMsg
+        //m_Destination=m_Owner
+        inv_sendCacheInvalidate;
+        //Sender=Dir
+        sth_profileHit;
+        judge_private_share;
+        j_popIncomingRequestQueue;
+        //将requestToDir buffer挪入m_waiting_buffers
+        //将requestToDir中的请求移入stall_msg_map中
+    }
+    
+    transition(V_FX_V, WB_Data) { 
+        d_updateAck;
+        //更新ack数量
+        d_updateSharers;
+        //更新sharer信息
+        a_sendAck;
+        //向LLC发送WB_ACK消息
+        k_popIncomingResponseQueue;
+    }
+
+    transition(V_FX_V, WB_Data_Final, V) {
+        d_updateSharers;
+        //更新sharer信息
+        a_sendAck;
+        //向LLC发送WB_ACK消息
+        dsefc_sendData_Exclusive_from_Cache;
+        //向请求者发送数据
+        k_popIncomingResponseQueue;
+        //清除Response队列首部的消息
+        w_deallocateTBE;
+        //释放TBE资源
+        kd_wakeUpDependents;
+    }
+
+    
+    transition(V_FX_V, {UPGRADE_I, UPGRADE_NI}) {
+        z_stallAndWaitRequest;
+    }
+
+    transition(V, FetchS, V_FS_V){
+        rst_setMRU;
+        v_allocateTBE;
+        d_RequestCacheData;
+        sth_profileHit;
+        judge_private_share;
+        j_popIncomingRequestQueue;
+    }
+
+    transition(V_FS_V, {WB_Data, WB_Data_Final}, V) {
+        d_updateSharers;
+        //更新sharer信息
+        a_sendAck;
+        //向LLC发送WB_ACK消息
+        dfc_sendData_from_Cache;
+        //d_sendData发送数据然后更新sharer
+        w_deallocateTBE;
+        k_popIncomingResponseQueue;
+        kd_wakeUpDependents;
+    }
+
+    transition(V_FS_V, RD_Data, V) {
+        dfc_sendData_from_Cache;
+        //d_sendData发送数据然后更新sharer
+        w_deallocateTBE;
+        k_popIncomingResponseQueue;
+        kd_wakeUpDependents;
+    }
+
+    transition(V_FS_V, {UPGRADE_I, UPGRADE_NI}) {
+        z_stallAndWaitRequest;
+    }
+
+    transition(V, RD_Data) {
+        k_popIncomingResponseQueue;
+    }
+
+    transition(V, UPGRADE_NI) {
+        rst_setMRU;
+        ani_sendUpgradeAck;
+        sth_profileHit;
+        judge_private_share;
+        j_popIncomingRequestQueue;
+    }
+
+    transition(V, UPGRADE_I, V_UD_V) {
+        rst_setMRU;
+        v_allocateTBE;
+        //生成消息INV消息进入responseFromDir队列
+        //out_msg=ResponseMsg
+        //m_Destination=m_Owner
+        invllc_sendCacheInvalidateMinusRequestor;
+        //Sender=Dir
+        sth_profileHit;
+        judge_private_share;
+        j_popIncomingRequestQueue;
+        //将requestToDir buffer挪入m_waiting_buffers
+        //将requestToDir中的请求移入stall_msg_map中
+    }
+
+    transition(V_UD_V, WB_Data) {
+        d_updateAck;
+        //更新ack数量
+        d_updateSharers;
+        //更新sharer信息
+        a_sendAck;
+        //向LLC发送WB_ACK消息
+        k_popIncomingResponseQueue;
+    }
+
+    transition(V_UD_V, WB_Data_Final, V) {
+        d_updateSharers;
+        //更新sharer信息
+        a_sendUpgradeAck;
+        //向请求者发送数据
+        a_sendAck;
+        //向LLC发送WB_ACK消息
+        k_popIncomingResponseQueue;
+        //清除Response队列首部的消息
+        w_deallocateTBE;
+        //释放TBE资源
+        kd_wakeUpDependents;
+    }
+
+
+    transition(V_UD_V, {UPGRADE_I, UPGRADE_NI}){
+        z_stallAndWaitRequest;
+    }
+
+    transition(V, WB_Data) {
+        d_updateSharers;
+        //更新Sharers信息
+        a_sendAck;
+        //虽然是Dirty写回，但Cache中还有其他副本，所以无需写回内存
+        k_popIncomingResponseQueue;
+    }
+
+    transition(V, WB_Data_Final, V_I) {
+        //LLC写回数据到达
+        d_updateSharers;
+        //从responseToDir中抓消息，携带写回数据放入requestToMemory中
+        qw_queueMemoryWBRequest;
+        //从responseToDir中删除消息
+        k_popIncomingResponseQueue;
+    }
+
+    transition(V_I, Memory_Ack, I) {
+        //从responseFromMemory中抓取消息进入responseFromDir_ptr
+        aa_sendAck;
+        //释放st的entry
+        std_SnoopTableDeallocate;
+        //删除responseFromMemory的队首元素
+        l_popMemQueue;
+        //唤醒因此waiting的requests
+        kd_wakeUpDependents;
+    }
+
+    transition(V, WB_Data_Clean, I) {
+        a_sendAck;
+        d_updateSharers;
+        std_SnoopTableDeallocate;
+        k_popIncomingResponseQueue;
+    }
+
+    // SnoopTable Replacement
+    transition(V, ST_Replacement, V_RI) {
+        v_allocateTBE;
+        inv_sendCacheInvalidate;
+    }
+
+    transition(V_RI, WB_Data) {
+        d_updateAck;
+        d_updateSharers;
+        a_sendAck;
+        k_popIncomingResponseQueue;
+    }
+
+    transition(V_RI, WB_Data_Final, V_I) {
+        d_updateAck;
+        d_updateSharers;
+        w_deallocateTBE;
+        qw_queueMemoryWBRequest;
+        k_popIncomingResponseQueue;
+    }
+
+    //added by SS for dma support
+    transition(I, DMA_READ, ID) {
+        //从requestToDir中抓取消息，根据抓取到的消息创建TBE对象
+        v_allocateTBE;
+        //DMA_READ要读取内存，从requestToDir中抓取消息放入requestToMemory中
+        //Dir Entry等待Memory回复数据中
+        qf_queueMemoryFetchRequestDMA;
+        stm_profileMiss;
+        //删除requestToDir队列的队首元素
+        j_popIncomingRequestQueue;
+    }
+
+    transition(ID, Memory_Data, I) {
+        //DMA_Read请求中，Memory的数据到达
+        //从responseFromMemory抓取携带数据的消息，发送给tbe的请求者
+        dr_sendDMAData;
+        //释放掉相应的TBE资源
+        w_deallocateTBE;
+        //删除responseFromMemory的队首元素
+        l_popMemQueue;
+        //唤醒因此waiting的requests
+        kd_wakeUpDependents;
+    }
+
+    transition(I, DMA_WRITE, ID_W) {
+        //从requestToDir中抓取消息，根据抓取到的消息创建TBE对象
+        v_allocateTBE;
+        //DMA_READ要写内存，从requestToDir中抓取携带数据的消息放入requestToMemory中
+        qw_queueMemoryWBRequest_partial;
+        stm_profileMiss;
+        //删除requestToDir队列的队首元素
+        j_popIncomingRequestQueue;
+    }
+
+    transition(ID_W, Memory_Ack, I) {
+        //DMA写请求收到Memory Ack消息
+        //生成CoherenceResponseType_ACK消息放入responseFromDir队列中
+        da_sendDMAAck;
+        //释放掉相应的TBE资源
+        w_deallocateTBE;
+        //删除responseFromMemory队列的队首元素
+        l_popMemQueue;
+        //唤醒因此waiting的request
+        kd_wakeUpDependents;
+    }
+
+    transition({ID, ID_W, V_DRD, V_DRDI, V_DWR, V_DWRI, I_V, V_I, V_FS_V, V_FX_V, V_UD_V, V_RI}, {FetchS, FetchX, ST_Replacement}) {
+        z_stallAndWaitRequest;
+    }
+
+    transition({ID, ID_W, V_DRD, V_DRDI, V_DWR, V_DWRI, I_V, V_I, V_FS_V, V_FX_V, V_UD_V, V_RI}, {DMA_WRITE, DMA_READ} ) {
+        //遇到这些情况时，将requestToDir顶部的消息放倒尾部，重新入列
+        zz_recycleDMAQueue;
+    }
+
+    transition(V, DMA_READ, V_DRD) {
+        rst_setMRU;
+        //从requestToDir中抓取消息，根据抓取到的消息创建TBE对象
+        v_allocateTBE;
+        //向拥有这个块的Owner发送请求数据消息，等待回应中
+        d_RequestCacheData;
+        sth_profileHit;
+        //删除requestToDir队首的元素
+        j_popIncomingRequestQueue;
+    }
+
+    transition(V_DRD, RD_Data, V) {
+        //收到了来自LLC的RD_Data, 发送数据给DMA Controller
+        drp_sendDMAData;
+        //释放掉相应的TBE资源
+        w_deallocateTBE;
+        //从responseToDir中删除队首消息
+        k_popIncomingResponseQueue;
+        kd_wakeUpDependents;
+    }
+
+    transition(V_DRD, WB_Data, V) {
+        d_updateSharers;
+        a_sendAck;
+        drp_sendDMAData;
+        w_deallocateTBE;
+        //从responseToDir中删除队首消息
+        k_popIncomingResponseQueue;
+        kd_wakeUpDependents;
+    }
+
+    transition(V_DRD, WB_Data_Final, V_I) {
+        d_updateSharers;
+        drp_sendDMAData;
+        w_deallocateTBE;
+        //从responseToDir中删除队首消息
+        qw_queueMemoryWBRequest;
+        k_popIncomingResponseQueue;
+    }
+
+    transition(V, DMA_WRITE, V_DWR) {
+        //从requestToDir中抓取消息，根据抓取到的消息创建TBE对象
+        v_allocateTBE;
+        //向拥有该数据的cache发送Invalid消息
+        inv_sendCacheInvalidate;
+        sth_profileHit;
+        //删除requestToDir队首的元素
+        j_popIncomingRequestQueue;
+    }
+
+    transition(V_DWR, WB_Data) {
+        d_updateSharers;
+        d_updateAck;
+        a_sendAck;
+        k_popIncomingResponseQueue;
+    }
+
+    transition(V_DWR, WB_Data_Final, V_DWRI) {
+        d_updateSharers;
+        //收到来自LLC的写回Data
+        a_sendAck;
+        //在responseToDir中抓取携带数据的队首信息，向memory发送写回消息
+        qw_queueMemoryWBRequest_partialTBE;
+        //从responseToDir中删除队首消息
+        k_popIncomingResponseQueue;
+    }
+
+    transition(V_DWRI, Memory_Ack, I) {
+        //收到来自内存的写回Ack消息，向L2发送Ack消息
+        //此时Cache不再保存有效副本，故变为I态
+        //向DMA Controller发送Ack消息，允许其进行DMA_Write
+        da_sendDMAAck;
+        //释放TBE资源
+        w_deallocateTBE;
+        std_SnoopTableDeallocate;
+        //弹出responseFromMemory队首消息
+        l_popMemQueue;
+        //唤醒因此停止的请求
+        kd_wakeUpDependents;
+    }
+}

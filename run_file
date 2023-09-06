@@ -1,0 +1,57 @@
+scons build/X86_MESI_Three_Level/gem5.opt --default=X86 PROTOCOL=MESI_Three_Level SLICC_HTML=True -j4 
+scons build/X86_MESI_Three_Level_K/gem5.opt --default=X86 PROTOCOL=MESI_Three_Level_K SLICC_HTML=True -j4 
+
+#003(crossbar) 结构
+./build/X86_MESI_Three_Level/gem5.opt \
+configs/example/fs.py --script=./scripts/inputfile4 \
+--kernel=./parsec-img/x86-linux-kernel-4.19.83 \
+--disk=./parsec-img/x86-parsec --num-cpus=16 --caches --l2cache \
+--num-clusters=4 --num-dirs=4 --num-l2caches=4 --ruby \
+--l0i_size=8kB --l0d_size=8kB --l0i_assoc=1 --l0d_assoc=1 \
+--l1d_size=128kB --l1d_assoc=4 --l2_size=1MB --mem-size='4GB' \
+
+#normal test
+./build/X86_MESI_Three_Level/gem5.opt \
+configs/example/fs.py --script=./scripts/inputfile0 \
+--kernel=./parsec-img/x86-linux-kernel-4.19.83 \
+--disk=./parsec-img/x86-parsec --num-cpus=16 --caches --l2cache \
+--num-clusters=4 --num-dirs=4 --num-l2caches=4 --ruby \
+--l0i_size=8kB --l0d_size=8kB --l0i_assoc=1 --l0d_assoc=1 \
+--l1d_size=128kB --l1d_assoc=4 --l2_size=1MB --mem-size='4GB' \
+
+#K test
+./build/X86_MESI_Three_Level_K/gem5.opt \
+configs/example/fs.py --script=./scripts/inputfile1 \
+--kernel=./parsec-img/x86-linux-kernel-4.19.83 \
+--disk=./parsec-img/x86-parsec --num-cpus=16 --caches --l2cache \
+--num-clusters=4 --num-dirs=4 --num-l2caches=4 --ruby \
+--l0i_size=8kB --l0d_size=8kB --l0i_assoc=1 --l0d_assoc=1 \
+--l1d_size=128kB --l1d_assoc=4 --l2_size=1MB --mem-size='4GB' \
+
+#Mesh 结构
+./build/X86_MESI_Three_Level/gem5.opt \
+configs/example/fs.py --script=./scripts/inputfile0 \
+--kernel=./parsec-img/x86-linux-kernel-4.19.83 \
+--disk=./parsec-img/x86-parsec --num-cpus=4 \
+--num-dirs=4 --network=simple --mesh-rows=2 \
+--ruby --num-l2caches=4 --topology=Mesh_XY \
+--l0i_size=8kB --l0d_size=8kB --l0i_assoc=1 --l0d_assoc=1 \
+--l1d_size=128kB --l1d_assoc=4 --l2_size=1MB --mem-size='4GB' \
+
+benchmark_choices = [
+    "blackscholes",         6h
+    "bodytrack",            8h      10h
+    "canneal",              9h
+    "dedup",                10h
+    "facesim",              Killed
+    "ferret",               10h
+    "fluidanimate",         Success
+    "freqmine",             10h
+    "raytrace",             31h
+    "streamcluster",        11h
+    "swaptions",            9h
+    "vips",                 11h
+    "x264",                 6h
+]
+
+["simsmall", "simmedium", "simlarge"]

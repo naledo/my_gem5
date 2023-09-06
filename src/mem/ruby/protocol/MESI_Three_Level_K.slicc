@@ -1,0 +1,9 @@
+protocol "MESI_Three_Level_K";
+include "RubySlicc_interfaces.slicc";
+include "MESI_Two_Level-msg.sm";
+include "MESI_Three_Level-msg.sm";
+include "MESI_Three_Level-L0cache_K.sm";
+include "MESI_Three_Level-L1cache_K.sm";
+include "MESI_Three_Level-L2cache_K.sm";
+include "MESI_Three_Level-dir_K.sm";
+include "MESI_Two_Level-dma.sm";
